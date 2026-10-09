@@ -1,0 +1,1127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TimeFlow - Production Time Management System</title>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['"Plus Jakarta Sans"', 'sans-serif'],
+            mono: ['"JetBrains Mono"', 'monospace'],
+          },
+          colors: {
+            brand: {
+              50: '#f0fdf4',
+              100: '#dcfce7',
+              500: '#22c55e',
+              600: '#16a34a',
+              700: '#15803d',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    /* Custom scrollbars */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 9999px; }
+    ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+  </style>
+</head>
+<body class="bg-slate-100 text-slate-800 antialiased font-sans">
+  <div id="app"></div>
+
+  <script>
+    // Global Application State
+    const state = {
+      token: localStorage.getItem('tm_token') || null,
+      user: JSON.parse(localStorage.getItem('tm_user') || 'null'),
+      currentTab: 'dashboard',
+      authView: 'login', // 'login' or 'signup'
+      tasks: [],
+      timeLogs: [],
+      summary: null,
+      searchQuery: '',
+      categoryFilter: 'ALL',
+      priorityFilter: 'ALL',
+      statusFilter: 'ALL',
+      viewMode: 'kanban', // 'kanban' or 'list'
+      isModalOpen: false,
+      taskToEdit: null,
+      // Pomodoro State
+      pomodoro: {
+        mode: 'work', // 'work', 'shortBreak', 'longBreak'
+        timeLeft: 25 * 60,
+        isRunning: false,
+        timerId: null,
+        soundEnabled: true,
+        attachedTaskId: null,
+        sessionNotes: '',
+        sessionStartTime: null,
+        notification: null,
+      }
+    };
+
+    const TIMER_CONFIG = {
+      work: { label: 'Deep Work', defaultMinutes: 25, badgeColor: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+      shortBreak: { label: 'Short Break', defaultMinutes: 5, badgeColor: 'bg-teal-50 text-teal-700 border-teal-200' },
+      longBreak: { label: 'Long Break', defaultMinutes: 15, badgeColor: 'bg-indigo-50 text-indigo-700 border-indigo-200' }
+    };
+
+    // Synthesized Web Audio API completion chime
+    function playAlertSound() {
+      if (!state.pomodoro.soundEnabled) return;
+      try {
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(880, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(1318.51, audioCtx.currentTime + 0.3);
+        gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.8);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.8);
+      } catch (e) {
+        console.warn('Audio not allowed', e);
+      }
+    }
+
+    // API Helper
+    async function apiRequest(endpoint, options = {}) {
+      const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+      if (state.token) {
+        headers['Authorization'] = `Bearer ${state.token}`;
+      }
+      const response = await fetch(`/api/v1${endpoint}`, { ...options, headers });
+      if (response.status === 401) {
+        state.token = null;
+        state.user = null;
+        localStorage.removeItem('tm_token');
+        localStorage.removeItem('tm_user');
+        render();
+        throw new Error('Unauthorized');
+      }
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({ message: 'Request failed' }));
+        throw new Error(err.message || 'Request failed');
+      }
+      if (response.status === 204) return null;
+      return await response.json();
+    }
+
+    // Data Loaders
+    async function loadData() {
+      if (!state.token) return;
+      try {
+        const [sumRes, tasksRes, logsRes] = await Promise.all([
+          apiRequest('/analytics/summary'),
+          apiRequest('/tasks'),
+          apiRequest('/timelogs')
+        ]);
+        state.summary = sumRes;
+        state.tasks = tasksRes;
+        state.timeLogs = logsRes;
+      } catch (err) {
+        console.error('Data load error:', err);
+      }
+      render();
+    }
+
+    // Pomodoro Timer Logic
+    function startTimer() {
+      if (state.pomodoro.isRunning) return;
+      state.pomodoro.isRunning = true;
+      if (!state.pomodoro.sessionStartTime) {
+        state.pomodoro.sessionStartTime = new Date();
+      }
+      state.pomodoro.timerId = setInterval(() => {
+        if (state.pomodoro.timeLeft <= 1) {
+          handleTimerComplete();
+        } else {
+          state.pomodoro.timeLeft--;
+          updateTimerDisplayOnly();
+        }
+      }, 1000);
+      render();
+    }
+
+    function pauseTimer() {
+      state.pomodoro.isRunning = false;
+      if (state.pomodoro.timerId) clearInterval(state.pomodoro.timerId);
+      render();
+    }
+
+    function resetTimer() {
+      state.pomodoro.isRunning = false;
+      if (state.pomodoro.timerId) clearInterval(state.pomodoro.timerId);
+      state.pomodoro.timeLeft = TIMER_CONFIG[state.pomodoro.mode].defaultMinutes * 60;
+      state.pomodoro.sessionStartTime = null;
+      render();
+    }
+
+    function switchMode(newMode) {
+      pauseTimer();
+      state.pomodoro.mode = newMode;
+      state.pomodoro.timeLeft = TIMER_CONFIG[newMode].defaultMinutes * 60;
+      state.pomodoro.sessionStartTime = null;
+      render();
+    }
+
+    async function handleTimerComplete() {
+      pauseTimer();
+      playAlertSound();
+      const durationMinutes = TIMER_CONFIG[state.pomodoro.mode].defaultMinutes;
+      const endTime = new Date();
+      const startTime = state.pomodoro.sessionStartTime || new Date(endTime.getTime() - durationMinutes * 60 * 1000);
+
+      if (state.pomodoro.mode === 'work') {
+        try {
+          await apiRequest('/timelogs', {
+            method: 'POST',
+            body: JSON.stringify({
+              taskId: state.pomodoro.attachedTaskId ? Number(state.pomodoro.attachedTaskId) : null,
+              startTime: startTime.toISOString().replace('Z', ''),
+              endTime: endTime.toISOString().replace('Z', ''),
+              durationMinutes: durationMinutes,
+              notes: state.pomodoro.sessionNotes.trim() || `Pomodoro session completed (${durationMinutes}m)`
+            })
+          });
+          state.pomodoro.notification = `Work session saved! +${durationMinutes}m added.`;
+          await loadData();
+        } catch (e) {
+          state.pomodoro.notification = 'Session ended (local record)';
+        }
+      } else {
+        state.pomodoro.notification = `${TIMER_CONFIG[state.pomodoro.mode].label} completed!`;
+      }
+
+      setTimeout(() => {
+        if (state.pomodoro.mode === 'work') {
+          switchMode('shortBreak');
+        } else {
+          switchMode('work');
+        }
+        setTimeout(() => {
+          state.pomodoro.notification = null;
+          render();
+        }, 4000);
+      }, 1500);
+    }
+
+    function updateTimerDisplayOnly() {
+      const clockEl = document.getElementById('timer-clock-text');
+      const circleEl = document.getElementById('timer-svg-circle');
+      if (clockEl) {
+        const mins = Math.floor(state.pomodoro.timeLeft / 60);
+        const secs = state.pomodoro.timeLeft % 60;
+        clockEl.innerText = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+      }
+      if (circleEl) {
+        const total = TIMER_CONFIG[state.pomodoro.mode].defaultMinutes * 60;
+        const progress = ((total - state.pomodoro.timeLeft) / total) * 100;
+        const circum = 2 * Math.PI * 44;
+        circleEl.style.strokeDashoffset = circum * (1 - progress / 100);
+      }
+    }
+
+    // Auth actions
+    async function handleLogin(e) {
+      e.preventDefault();
+      const username = e.target.username.value;
+      const password = e.target.password.value;
+      const errorEl = document.getElementById('auth-error');
+      try {
+        const res = await apiRequest('/auth/login', {
+          method: 'POST',
+          body: JSON.stringify({ username, password })
+        });
+        state.token = res.token;
+        state.user = { id: res.id, username: res.username, email: res.email };
+        localStorage.setItem('tm_token', res.token);
+        localStorage.setItem('tm_user', JSON.stringify(state.user));
+        await loadData();
+      } catch (err) {
+        if (errorEl) {
+          errorEl.innerText = err.message || 'Login failed';
+          errorEl.classList.remove('hidden');
+        }
+      }
+    }
+
+    async function handleSignup(e) {
+      e.preventDefault();
+      const username = e.target.username.value;
+      const email = e.target.email.value;
+      const password = e.target.password.value;
+      const errorEl = document.getElementById('auth-error');
+      try {
+        const res = await apiRequest('/auth/signup', {
+          method: 'POST',
+          body: JSON.stringify({ username, email, password })
+        });
+        state.token = res.token;
+        state.user = { id: res.id, username: res.username, email: res.email };
+        localStorage.setItem('tm_token', res.token);
+        localStorage.setItem('tm_user', JSON.stringify(state.user));
+        await loadData();
+      } catch (err) {
+        if (errorEl) {
+          errorEl.innerText = err.message || 'Signup failed';
+          errorEl.classList.remove('hidden');
+        }
+      }
+    }
+
+    function handleLogout() {
+      state.token = null;
+      state.user = null;
+      localStorage.removeItem('tm_token');
+      localStorage.removeItem('tm_user');
+      render();
+    }
+
+    // Task Actions
+    async function handleSaveTask(e) {
+      e.preventDefault();
+      const form = e.target;
+      const payload = {
+        title: form.title.value.trim(),
+        description: form.description.value.trim() || undefined,
+        category: form.category.value,
+        priority: form.priority.value,
+        dueDate: form.dueDate.value || undefined,
+        estimatedTimeMinutes: Number(form.estimatedTimeMinutes.value) || 0,
+        completed: form.completed ? form.completed.checked : false
+      };
+
+      try {
+        if (state.taskToEdit) {
+          await apiRequest(`/tasks/${state.taskToEdit.id}`, { method: 'PUT', body: JSON.stringify(payload) });
+        } else {
+          await apiRequest('/tasks', { method: 'POST', body: JSON.stringify(payload) });
+        }
+        state.isModalOpen = false;
+        state.taskToEdit = null;
+        await loadData();
+      } catch (err) {
+        alert(err.message || 'Error saving task');
+      }
+    }
+
+    async function toggleTaskComplete(id) {
+      try {
+        await apiRequest(`/tasks/${id}/toggle-complete`, { method: 'PATCH' });
+        await loadData();
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    async function deleteTask(id) {
+      if (confirm('Are you sure you want to delete this task?')) {
+        try {
+          await apiRequest(`/tasks/${id}`, { method: 'DELETE' });
+          await loadData();
+        } catch (err) {
+          console.error(err);
+        }
+      }
+    }
+
+    function startPomodoroForTask(taskId) {
+      state.pomodoro.attachedTaskId = taskId;
+      state.currentTab = 'pomodoro';
+      render();
+    }
+
+    // Helper formatting
+    function formatTime(secs) {
+      const m = Math.floor(secs / 60);
+      const s = secs % 60;
+      return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    }
+
+    function getCategoryBadge(cat) {
+      if (cat === 'WORK') return `<span class="inline-flex items-center gap-1 text-[10px] font-semibold text-blue-700 bg-blue-50 px-2 py-0.5 rounded-full border border-blue-200"><i data-lucide="briefcase" class="w-2.5 h-2.5"></i> Work</span>`;
+      if (cat === 'STUDY') return `<span class="inline-flex items-center gap-1 text-[10px] font-semibold text-purple-700 bg-purple-50 px-2 py-0.5 rounded-full border border-purple-200"><i data-lucide="book-open" class="w-2.5 h-2.5"></i> Study</span>`;
+      return `<span class="inline-flex items-center gap-1 text-[10px] font-semibold text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200"><i data-lucide="user" class="w-2.5 h-2.5"></i> Personal</span>`;
+    }
+
+    function getPriorityBadge(prio) {
+      if (prio === 'HIGH') return `<span class="text-[10px] font-bold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded">HIGH</span>`;
+      if (prio === 'MEDIUM') return `<span class="text-[10px] font-medium text-amber-600 bg-amber-50 px-1.5 py-0.5 rounded">MED</span>`;
+      return `<span class="text-[10px] font-medium text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded">LOW</span>`;
+    }
+
+    // Main Renderer
+    function render() {
+      const app = document.getElementById('app');
+
+      if (!state.token) {
+        // Render Login / Signup Screen
+        app.innerHTML = `
+          <div class="min-h-screen bg-slate-900 flex items-center justify-center p-4">
+            <div class="max-w-md w-full bg-white rounded-3xl p-8 shadow-2xl border border-slate-100">
+              <div class="flex flex-col items-center text-center mb-8">
+                <div class="w-12 h-12 rounded-2xl bg-gradient-to-tr from-emerald-500 to-teal-400 flex items-center justify-center text-white shadow-lg shadow-emerald-500/25 mb-4">
+                  <i data-lucide="clock" class="w-6 h-6"></i>
+                </div>
+                <h2 class="text-2xl font-bold text-slate-900 tracking-tight">${state.authView === 'login' ? 'Welcome to TimeFlow' : 'Create Account'}</h2>
+                <p class="text-xs text-slate-500 mt-1">${state.authView === 'login' ? 'Sign in to your production time workspace' : 'Get started with Spring Boot & Pomodoro'}</p>
+              </div>
+
+              <div id="auth-error" class="hidden mb-6 p-3 bg-rose-50 border border-rose-200 text-rose-700 text-xs rounded-xl flex items-center gap-2"></div>
+
+              <form onsubmit="${state.authView === 'login' ? 'handleLogin(event)' : 'handleSignup(event)'}" class="space-y-4">
+                <div>
+                  <label class="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5">Username</label>
+                  <input type="text" name="username" value="${state.authView === 'login' ? 'demo' : ''}" required class="w-full px-4 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500" placeholder="e.g. demo" />
+                </div>
+
+                ${state.authView === 'signup' ? `
+                <div>
+                  <label class="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5">Email</label>
+                  <input type="email" name="email" required class="w-full px-4 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500" placeholder="alice@example.com" />
+                </div>` : ''}
+
+                <div>
+                  <label class="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5">Password</label>
+                  <input type="password" name="password" value="${state.authView === 'login' ? 'password123' : ''}" required class="w-full px-4 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500" placeholder="••••••••" />
+                </div>
+
+                <div class="pt-2">
+                  <button type="submit" class="w-full py-3 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold text-sm shadow-md shadow-emerald-600/20 transition flex items-center justify-center gap-2">
+                    <span>${state.authView === 'login' ? 'Sign In to Workspace' : 'Sign Up'}</span>
+                    <i data-lucide="arrow-right" class="w-4 h-4"></i>
+                  </button>
+                </div>
+              </form>
+
+              <div class="mt-6 pt-6 border-t border-slate-100 flex flex-col items-center gap-3">
+                ${state.authView === 'login' ? `
+                <button type="button" onclick="document.querySelector('[name=username]').value='demo'; document.querySelector('[name=password]').value='password123';" class="text-xs text-emerald-600 hover:text-emerald-700 font-semibold">
+                  Pre-fill Demo Account (demo / password123)
+                </button>
+                <p class="text-xs text-slate-500">
+                  Don't have an account? <button type="button" onclick="state.authView='signup'; render();" class="font-bold text-emerald-600 hover:underline">Sign Up</button>
+                </p>` : `
+                <p class="text-xs text-slate-500">
+                  Already have an account? <button type="button" onclick="state.authView='login'; render();" class="font-bold text-emerald-600 hover:underline">Sign In</button>
+                </p>`}
+              </div>
+            </div>
+          </div>
+        `;
+        lucide.createIcons();
+        return;
+      }
+
+      // Filtered Tasks for Views
+      const filteredTasks = state.tasks.filter(t => {
+        const matchesSearch = t.title.toLowerCase().includes(state.searchQuery.toLowerCase()) ||
+          (t.description && t.description.toLowerCase().includes(state.searchQuery.toLowerCase()));
+        const matchesCategory = state.categoryFilter === 'ALL' || t.category === state.categoryFilter;
+        const matchesPriority = state.priorityFilter === 'ALL' || t.priority === state.priorityFilter;
+        const matchesStatus = state.statusFilter === 'ALL' ||
+          (state.statusFilter === 'COMPLETED' ? t.completed : !t.completed);
+        return matchesSearch && matchesCategory && matchesPriority && matchesStatus;
+      });
+
+      // Layout with Sidebar and Content
+      app.innerHTML = `
+        <div class="min-h-screen bg-slate-100 flex">
+          <!-- Sidebar -->
+          <aside class="w-64 bg-slate-900 text-slate-100 flex flex-col h-screen fixed left-0 top-0 border-r border-slate-800 z-30">
+            <div class="h-16 flex items-center px-6 border-b border-slate-800 gap-3">
+              <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-emerald-500 to-teal-400 flex items-center justify-center text-white shadow-lg shadow-emerald-500/20">
+                <i data-lucide="clock" class="w-5 h-5"></i>
+              </div>
+              <div>
+                <h1 class="font-bold text-base tracking-tight text-white">TimeFlow</h1>
+                <p class="text-[11px] text-slate-400">Spring Boot 3 + React</p>
+              </div>
+            </div>
+
+            <nav class="flex-1 px-4 py-6 space-y-1.5 overflow-y-auto">
+              <div class="text-[10px] font-semibold tracking-wider text-slate-400 uppercase px-3 mb-2">Workspace</div>
+              ${[
+                { id: 'dashboard', label: 'Dashboard', icon: 'layout-dashboard' },
+                { id: 'tasks', label: 'Task Board', icon: 'check-square' },
+                { id: 'pomodoro', label: 'Pomodoro Timer', icon: 'timer' },
+                { id: 'analytics', label: 'Time Analytics', icon: 'bar-chart-3' }
+              ].map(item => `
+                <button onclick="state.currentTab='${item.id}'; render();" class="w-full flex items-center gap-3.5 px-3.5 py-2.5 rounded-lg text-sm font-medium transition ${
+                  state.currentTab === item.id ? 'bg-emerald-600 text-white font-semibold shadow-md shadow-emerald-600/20' : 'text-slate-300 hover:bg-slate-800/80 hover:text-white'
+                }">
+                  <i data-lucide="${item.icon}" class="w-4 h-4"></i>
+                  <span>${item.label}</span>
+                </button>
+              `).join('')}
+            </nav>
+
+            <div class="p-4 border-t border-slate-800 bg-slate-950/40">
+              <div class="flex items-center gap-3 px-2 py-2 mb-2 rounded-lg bg-slate-800/40 border border-slate-800">
+                <div class="w-8 h-8 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center font-bold text-xs uppercase">
+                  ${state.user?.username ? state.user.username.charAt(0) : 'U'}
+                </div>
+                <div class="flex-1 min-w-0">
+                  <p class="text-xs font-semibold text-slate-200 truncate">${state.user?.username}</p>
+                  <p class="text-[10px] text-slate-400 truncate">${state.user?.email}</p>
+                </div>
+              </div>
+              <button onclick="handleLogout()" class="w-full flex items-center justify-center gap-2 px-3 py-2 text-xs font-medium text-rose-400 hover:bg-rose-500/10 rounded-lg transition">
+                <i data-lucide="log-out" class="w-3.5 h-3.5"></i>
+                <span>Sign Out</span>
+              </button>
+            </div>
+          </aside>
+
+          <!-- Main Content Area -->
+          <div class="flex-1 ml-64 flex flex-col min-h-screen">
+            <!-- Navbar -->
+            <header class="h-16 bg-white/80 backdrop-blur-md border-b border-slate-200 sticky top-0 z-20 px-8 flex items-center justify-between">
+              <h2 class="text-xl font-bold text-slate-800 tracking-tight capitalize">
+                ${state.currentTab === 'dashboard' ? 'Overview Dashboard' : state.currentTab === 'tasks' ? 'Task Management Board' : state.currentTab === 'pomodoro' ? 'Pomodoro Focus Timer' : 'Time Tracking Analytics'}
+              </h2>
+
+              <div class="flex items-center gap-3">
+                <button onclick="state.currentTab='pomodoro'; render();" class="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg border border-emerald-500/30 text-emerald-700 bg-emerald-50 hover:bg-emerald-100 text-xs font-semibold transition shadow-sm">
+                  <i data-lucide="play" class="w-3.5 h-3.5 fill-emerald-600 text-emerald-600"></i>
+                  Quick Focus
+                </button>
+                <button onclick="state.taskToEdit=null; state.isModalOpen=true; render();" class="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold shadow-sm transition">
+                  <i data-lucide="plus" class="w-4 h-4"></i>
+                  New Task
+                </button>
+              </div>
+            </header>
+
+            <main class="flex-1 p-8 max-w-7xl w-full mx-auto">
+              ${renderMainTab(filteredTasks)}
+            </main>
+          </div>
+        </div>
+
+        <!-- Task Create/Edit Modal -->
+        ${state.isModalOpen ? renderTaskModal() : ''}
+      `;
+
+      lucide.createIcons();
+    }
+
+    function renderMainTab(filteredTasks) {
+      if (state.currentTab === 'dashboard') {
+        return `
+          <div class="space-y-8">
+            <!-- 4 Core Summary Cards -->
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-5">
+              <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex items-center justify-between">
+                <div>
+                  <p class="text-xs font-semibold text-slate-500 uppercase tracking-wider">Completed Tasks</p>
+                  <h3 class="text-2xl font-bold text-slate-900 mt-1">${state.summary?.totalTasksCompleted ?? 0} <span class="text-xs font-normal text-slate-400">/ ${state.summary?.totalTasks ?? 0}</span></h3>
+                </div>
+                <div class="w-12 h-12 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center">
+                  <i data-lucide="check-circle" class="w-6 h-6"></i>
+                </div>
+              </div>
+
+              <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex items-center justify-between">
+                <div>
+                  <p class="text-xs font-semibold text-slate-500 uppercase tracking-wider">Productivity Score</p>
+                  <h3 class="text-2xl font-bold text-slate-900 mt-1">${state.summary?.productivityScore ?? 0}%</h3>
+                </div>
+                <div class="w-12 h-12 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center">
+                  <i data-lucide="percent" class="w-6 h-6"></i>
+                </div>
+              </div>
+
+              <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex items-center justify-between">
+                <div>
+                  <p class="text-xs font-semibold text-slate-500 uppercase tracking-wider">Logged Today</p>
+                  <h3 class="text-2xl font-bold text-slate-900 mt-1">${state.summary?.totalHoursLoggedToday ?? 0} <span class="text-xs font-normal text-slate-400">hrs</span></h3>
+                </div>
+                <div class="w-12 h-12 rounded-xl bg-amber-50 text-amber-600 flex items-center justify-center">
+                  <i data-lucide="clock" class="w-6 h-6"></i>
+                </div>
+              </div>
+
+              <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex items-center justify-between">
+                <div>
+                  <p class="text-xs font-semibold text-slate-500 uppercase tracking-wider">Logged This Week</p>
+                  <h3 class="text-2xl font-bold text-slate-900 mt-1">${state.summary?.totalHoursLoggedThisWeek ?? 0} <span class="text-xs font-normal text-slate-400">hrs</span></h3>
+                </div>
+                <div class="w-12 h-12 rounded-xl bg-purple-50 text-purple-600 flex items-center justify-center">
+                  <i data-lucide="calendar" class="w-6 h-6"></i>
+                </div>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
+              <div class="lg:col-span-5 space-y-4">
+                <h3 class="text-base font-bold text-slate-800 flex items-center gap-2">
+                  <i data-lucide="flame" class="w-4 h-4 text-emerald-600"></i> Focus Zone
+                </h3>
+                ${renderPomodoroWidget()}
+              </div>
+
+              <div class="lg:col-span-7 space-y-6">
+                <!-- Active Tasks -->
+                <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-6">
+                  <div class="flex items-center justify-between pb-4 border-b border-slate-100">
+                    <div>
+                      <h3 class="text-base font-bold text-slate-800">Active Priority Tasks</h3>
+                      <p class="text-xs text-slate-500">Assigned to your account</p>
+                    </div>
+                    <button onclick="state.currentTab='tasks'; render();" class="text-xs font-semibold text-emerald-600 hover:text-emerald-700 flex items-center gap-1">
+                      View all (${state.tasks.length}) <i data-lucide="arrow-right" class="w-3.5 h-3.5"></i>
+                    </button>
+                  </div>
+
+                  <div class="divide-y divide-slate-100 mt-2">
+                    ${state.tasks.filter(t => !t.completed).slice(0, 4).map(task => `
+                      <div class="py-3 flex items-center justify-between gap-4 hover:bg-slate-50/60 px-2 rounded-lg transition">
+                        <div class="flex-1 min-w-0">
+                          <div class="flex items-center gap-2 mb-1">
+                            ${getCategoryBadge(task.category)}
+                            ${getPriorityBadge(task.priority)}
+                          </div>
+                          <p class="text-sm font-semibold text-slate-800 truncate">${task.title}</p>
+                          <p class="text-xs text-slate-400 mt-0.5">Logged: ${task.actualTimeLoggedMinutes}m / Est: ${task.estimatedTimeMinutes}m</p>
+                        </div>
+                        <button onclick="startPomodoroForTask(${task.id})" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-50 text-emerald-700 hover:bg-emerald-100 text-xs font-semibold transition">
+                          <i data-lucide="play" class="w-3 h-3 fill-emerald-600"></i> Focus
+                        </button>
+                      </div>
+                    `).join('')}
+
+                    ${state.tasks.filter(t => !t.completed).length === 0 ? `
+                      <div class="py-8 text-center text-slate-400 text-xs">All tasks completed! Great job.</div>
+                    ` : ''}
+                  </div>
+                </div>
+
+                <!-- Recent Logs -->
+                <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-6">
+                  <div class="flex items-center justify-between pb-3 border-b border-slate-100">
+                    <h3 class="text-base font-bold text-slate-800">Recent Sessions Logged</h3>
+                    <span class="text-xs text-slate-400">${state.timeLogs.length} sessions</span>
+                  </div>
+                  <div class="mt-3 space-y-2.5">
+                    ${state.timeLogs.slice(0, 4).map(log => `
+                      <div class="flex items-center justify-between text-xs p-2.5 rounded-lg bg-slate-50 border border-slate-100">
+                        <div class="flex items-center gap-2.5">
+                          <span class="w-2 h-2 rounded-full bg-emerald-500"></span>
+                          <div>
+                            <p class="font-semibold text-slate-700">${log.taskTitle || 'General Focus Session'}</p>
+                            <p class="text-[10px] text-slate-400">${log.notes || 'Completed focus session'}</p>
+                          </div>
+                        </div>
+                        <div class="text-right">
+                          <span class="font-mono font-bold text-emerald-600">+${log.durationMinutes}m</span>
+                          <p class="text-[10px] text-slate-400">${new Date(log.startTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
+                        </div>
+                      </div>
+                    `).join('')}
+                    ${state.timeLogs.length === 0 ? `
+                      <div class="py-6 text-center text-slate-400 text-xs">No sessions logged yet today. Hit Start Focus above to record!</div>
+                    ` : ''}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      if (state.currentTab === 'tasks') {
+        return `
+          <div class="space-y-6">
+            <!-- Filter Bar -->
+            <div class="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm flex flex-col md:flex-row items-stretch md:items-center justify-between gap-4">
+              <div class="relative flex-1 max-w-md">
+                <i data-lucide="search" class="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2"></i>
+                <input type="text" oninput="state.searchQuery=this.value; render();" value="${state.searchQuery}" placeholder="Live search tasks..." class="w-full pl-9 pr-4 py-2 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-emerald-500 bg-slate-50/50" />
+              </div>
+
+              <div class="flex flex-wrap items-center gap-2.5">
+                <select onchange="state.categoryFilter=this.value; render();" class="px-2.5 py-1.5 border border-slate-200 rounded-lg text-xs text-slate-700 bg-white">
+                  <option value="ALL" ${state.categoryFilter === 'ALL' ? 'selected' : ''}>All Categories</option>
+                  <option value="WORK" ${state.categoryFilter === 'WORK' ? 'selected' : ''}>Work</option>
+                  <option value="PERSONAL" ${state.categoryFilter === 'PERSONAL' ? 'selected' : ''}>Personal</option>
+                  <option value="STUDY" ${state.categoryFilter === 'STUDY' ? 'selected' : ''}>Study</option>
+                </select>
+
+                <select onchange="state.priorityFilter=this.value; render();" class="px-2.5 py-1.5 border border-slate-200 rounded-lg text-xs text-slate-700 bg-white">
+                  <option value="ALL" ${state.priorityFilter === 'ALL' ? 'selected' : ''}>All Priorities</option>
+                  <option value="HIGH" ${state.priorityFilter === 'HIGH' ? 'selected' : ''}>High</option>
+                  <option value="MEDIUM" ${state.priorityFilter === 'MEDIUM' ? 'selected' : ''}>Medium</option>
+                  <option value="LOW" ${state.priorityFilter === 'LOW' ? 'selected' : ''}>Low</option>
+                </select>
+
+                <select onchange="state.statusFilter=this.value; render();" class="px-2.5 py-1.5 border border-slate-200 rounded-lg text-xs text-slate-700 bg-white">
+                  <option value="ALL" ${state.statusFilter === 'ALL' ? 'selected' : ''}>All Status</option>
+                  <option value="PENDING" ${state.statusFilter === 'PENDING' ? 'selected' : ''}>Pending</option>
+                  <option value="COMPLETED" ${state.statusFilter === 'COMPLETED' ? 'selected' : ''}>Completed</option>
+                </select>
+
+                <div class="flex bg-slate-100 p-0.5 rounded-lg border border-slate-200">
+                  <button onclick="state.viewMode='kanban'; render();" class="p-1.5 rounded-md ${state.viewMode === 'kanban' ? 'bg-white shadow-xs text-slate-900' : 'text-slate-400'}"><i data-lucide="layout-grid" class="w-4 h-4"></i></button>
+                  <button onclick="state.viewMode='list'; render();" class="p-1.5 rounded-md ${state.viewMode === 'list' ? 'bg-white shadow-xs text-slate-900' : 'text-slate-400'}"><i data-lucide="list" class="w-4 h-4"></i></button>
+                </div>
+
+                <button onclick="state.taskToEdit=null; state.isModalOpen=true; render();" class="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-semibold shadow-sm transition">
+                  <i data-lucide="plus" class="w-3.5 h-3.5"></i> Add Task
+                </button>
+              </div>
+            </div>
+
+            <!-- Kanban or List View -->
+            ${state.viewMode === 'kanban' ? renderKanban(filteredTasks) : renderListView(filteredTasks)}
+          </div>
+        `;
+      }
+
+      if (state.currentTab === 'pomodoro') {
+        return `
+          <div class="max-w-4xl mx-auto space-y-8">
+            <div class="text-center max-w-lg mx-auto">
+              <h2 class="text-2xl font-bold text-slate-900 tracking-tight">Pomodoro Focus Timer</h2>
+              <p class="text-xs text-slate-500 mt-1">Structured 25-minute intervals. Sessions immediately persist to Spring Boot REST backend.</p>
+            </div>
+            ${renderPomodoroWidget()}
+          </div>
+        `;
+      }
+
+      if (state.currentTab === 'analytics') {
+        const totalCat = state.summary?.categoryTaskCounts ? Object.values(state.summary.categoryTaskCounts).reduce((a, b) => a + b, 0) : 0;
+        return `
+          <div class="space-y-8">
+            <!-- Summary KPI -->
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-5">
+              <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+                <div class="flex items-center justify-between text-slate-500 mb-2">
+                  <span class="text-xs font-semibold uppercase tracking-wider">Productivity Score</span>
+                  <i data-lucide="trending-up" class="w-4 h-4 text-emerald-600"></i>
+                </div>
+                <div class="text-3xl font-bold text-slate-900">${state.summary?.productivityScore ?? 0}%</div>
+                <div class="w-full bg-slate-100 rounded-full h-1.5 mt-3">
+                  <div class="bg-emerald-500 h-1.5 rounded-full" style="width: ${Math.min(100, state.summary?.productivityScore ?? 0)}%"></div>
+                </div>
+              </div>
+
+              <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+                <div class="flex items-center justify-between text-slate-500 mb-2">
+                  <span class="text-xs font-semibold uppercase tracking-wider">Hours Today</span>
+                  <i data-lucide="clock" class="w-4 h-4 text-blue-600"></i>
+                </div>
+                <div class="text-3xl font-bold text-slate-900">${state.summary?.totalHoursLoggedToday ?? 0} <span class="text-sm font-normal text-slate-400">hrs</span></div>
+                <p class="text-[11px] text-slate-400 mt-2">Target: 4.0 hrs focus/day</p>
+              </div>
+
+              <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+                <div class="flex items-center justify-between text-slate-500 mb-2">
+                  <span class="text-xs font-semibold uppercase tracking-wider">Hours This Week</span>
+                  <i data-lucide="calendar" class="w-4 h-4 text-purple-600"></i>
+                </div>
+                <div class="text-3xl font-bold text-slate-900">${state.summary?.totalHoursLoggedThisWeek ?? 0} <span class="text-sm font-normal text-slate-400">hrs</span></div>
+                <p class="text-[11px] text-slate-400 mt-2">Target: 20.0 hrs/week</p>
+              </div>
+
+              <div class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm">
+                <div class="flex items-center justify-between text-slate-500 mb-2">
+                  <span class="text-xs font-semibold uppercase tracking-wider">Completed Tasks</span>
+                  <i data-lucide="check-circle" class="w-4 h-4 text-emerald-600"></i>
+                </div>
+                <div class="text-3xl font-bold text-slate-900">${state.summary?.totalTasksCompleted ?? 0} <span class="text-sm font-normal text-slate-400">/ ${state.summary?.totalTasks ?? 0}</span></div>
+                <p class="text-[11px] text-slate-400 mt-2">${state.summary?.totalTasksPending ?? 0} pending tasks</p>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <!-- Category Breakdown -->
+              <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-4">
+                <h3 class="font-bold text-sm text-slate-800 flex items-center gap-2">
+                  <i data-lucide="pie-chart" class="w-4 h-4 text-emerald-600"></i> Tasks by Category
+                </h3>
+                <div class="space-y-3 pt-2">
+                  ${['WORK', 'PERSONAL', 'STUDY'].map(cat => {
+                    const count = state.summary?.categoryTaskCounts?.[cat] ?? 0;
+                    const percent = totalCat > 0 ? Math.round((count / totalCat) * 100) : 0;
+                    const color = cat === 'WORK' ? 'bg-blue-500' : cat === 'STUDY' ? 'bg-purple-500' : 'bg-amber-500';
+                    return `
+                      <div class="space-y-1">
+                        <div class="flex justify-between text-xs text-slate-600 font-medium">
+                          <span>${cat}</span>
+                          <span>${count} tasks (${percent}%)</span>
+                        </div>
+                        <div class="w-full bg-slate-100 rounded-full h-2">
+                          <div class="${color} h-2 rounded-full" style="width: ${percent}%"></div>
+                        </div>
+                      </div>
+                    `;
+                  }).join('')}
+                </div>
+              </div>
+
+              <!-- Focus Insights -->
+              <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm flex flex-col justify-between">
+                <div>
+                  <h3 class="font-bold text-sm text-slate-800 flex items-center gap-2 mb-2">
+                    <i data-lucide="award" class="w-4 h-4 text-emerald-600"></i> Focus Stats
+                  </h3>
+                  <p class="text-xs text-slate-500">
+                    Total lifetime focus time logged: <strong class="text-slate-800">${state.summary?.totalHoursLoggedAllTime ?? 0} hours</strong>.
+                  </p>
+                </div>
+                <div class="mt-4 p-4 rounded-xl bg-gradient-to-r from-emerald-500/10 to-teal-500/10 border border-emerald-500/20 flex items-center gap-3">
+                  <div class="w-10 h-10 rounded-lg bg-emerald-600 text-white flex items-center justify-center">
+                    <i data-lucide="zap" class="w-5 h-5"></i>
+                  </div>
+                  <div>
+                    <h4 class="text-xs font-bold text-emerald-900">Consistency Habit</h4>
+                    <p class="text-[11px] text-emerald-700">Every 25m Pomodoro log updates your task actual duration and productivity score.</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Full Logs Table -->
+            <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+              <div class="p-5 border-b border-slate-100 font-bold text-sm text-slate-800">All Logged Sessions</div>
+              <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs text-slate-600">
+                  <thead class="bg-slate-50 text-[11px] uppercase tracking-wider text-slate-400 font-semibold border-b border-slate-100">
+                    <tr>
+                      <th class="px-5 py-3">Task</th>
+                      <th class="px-5 py-3">Duration</th>
+                      <th class="px-5 py-3">Notes</th>
+                      <th class="px-5 py-3">Time</th>
+                    </tr>
+                  </thead>
+                  <tbody class="divide-y divide-slate-100">
+                    ${state.timeLogs.map(log => `
+                      <tr class="hover:bg-slate-50/50">
+                        <td class="px-5 py-3.5 font-medium text-slate-800">${log.taskTitle || '<span class="italic text-slate-400">General Focus</span>'}</td>
+                        <td class="px-5 py-3.5 font-mono font-bold text-emerald-600">+${log.durationMinutes}m</td>
+                        <td class="px-5 py-3.5 text-slate-500">${log.notes || '—'}</td>
+                        <td class="px-5 py-3.5 text-slate-400">${new Date(log.startTime).toLocaleString()}</td>
+                      </tr>
+                    `).join('')}
+                    ${state.timeLogs.length === 0 ? `
+                      <tr><td colspan="4" class="px-5 py-8 text-center text-slate-400">No time logs recorded yet.</td></tr>
+                    ` : ''}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+    }
+
+    function renderPomodoroWidget() {
+      const mode = state.pomodoro.mode;
+      const totalSecs = TIMER_CONFIG[mode].defaultMinutes * 60;
+      const progress = ((totalSecs - state.pomodoro.timeLeft) / totalSecs) * 100;
+      const circum = 2 * Math.PI * 44;
+      const offset = circum * (1 - progress / 100);
+
+      const attachedTask = state.tasks.find(t => t.id === state.pomodoro.attachedTaskId);
+
+      return `
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 max-w-xl mx-auto flex flex-col items-center">
+          <!-- Modes -->
+          <div class="flex bg-slate-100 p-1 rounded-xl mb-6 w-full max-w-xs justify-between">
+            ${['work', 'shortBreak', 'longBreak'].map(m => `
+              <button onclick="switchMode('${m}')" class="flex-1 py-1.5 px-3 rounded-lg text-xs font-semibold transition ${
+                mode === m ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'
+              }">${TIMER_CONFIG[m].label}</button>
+            `).join('')}
+          </div>
+
+          ${state.pomodoro.notification ? `
+            <div class="mb-4 px-4 py-2 bg-emerald-100 border border-emerald-300 text-emerald-800 text-xs font-medium rounded-lg flex items-center gap-2">
+              <i data-lucide="check-circle-2" class="w-4 h-4 text-emerald-600"></i>
+              <span>${state.pomodoro.notification}</span>
+            </div>
+          ` : ''}
+
+          <!-- Timer Clock -->
+          <div class="relative w-64 h-64 flex items-center justify-center my-2">
+            <svg class="w-full h-full transform -rotate-90" viewBox="0 0 100 100">
+              <circle cx="50" cy="50" r="44" class="stroke-slate-100" stroke-width="5" fill="transparent" />
+              <circle id="timer-svg-circle" cx="50" cy="50" r="44" class="transition-all duration-1000 ease-linear ${
+                mode === 'work' ? 'stroke-emerald-500' : mode === 'shortBreak' ? 'stroke-teal-500' : 'stroke-indigo-500'
+              }" stroke-width="5" stroke-dasharray="${circum}" stroke-dashoffset="${offset}" stroke-linecap="round" fill="transparent" />
+            </svg>
+            <div class="absolute flex flex-col items-center justify-center">
+              <span id="timer-clock-text" class="text-5xl font-mono font-bold tracking-tight text-slate-800">
+                ${formatTime(state.pomodoro.timeLeft)}
+              </span>
+              <span class="text-[11px] font-semibold mt-2 px-2.5 py-0.5 rounded-full border ${TIMER_CONFIG[mode].badgeColor}">
+                ${state.pomodoro.isRunning ? 'FOCUSING' : 'READY'}
+              </span>
+            </div>
+          </div>
+
+          <!-- Controls -->
+          <div class="flex items-center gap-4 mt-6">
+            <button onclick="resetTimer()" title="Reset Timer" class="p-2.5 rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-50 transition shadow-sm">
+              <i data-lucide="rotate-ccw" class="w-4 h-4"></i>
+            </button>
+
+            <button onclick="${state.pomodoro.isRunning ? 'pauseTimer()' : 'startTimer()'}" class="flex items-center gap-2 px-6 py-3 rounded-xl font-bold text-sm shadow-md transition ${
+              state.pomodoro.isRunning ? 'bg-amber-500 hover:bg-amber-600 text-white shadow-amber-500/20' : 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-emerald-600/30'
+            }">
+              <i data-lucide="${state.pomodoro.isRunning ? 'pause' : 'play'}" class="w-4 h-4 fill-white"></i>
+              <span>${state.pomodoro.isRunning ? 'Pause' : 'Start Focus'}</span>
+            </button>
+
+            <button onclick="handleTimerComplete()" title="Finish / Skip" class="p-2.5 rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-50 transition shadow-sm">
+              <i data-lucide="skip-forward" class="w-4 h-4"></i>
+            </button>
+
+            <button onclick="state.pomodoro.soundEnabled=!state.pomodoro.soundEnabled; render();" title="Toggle Sound" class="p-2.5 rounded-xl border border-slate-200 text-slate-500 hover:bg-slate-50 transition shadow-sm">
+              <i data-lucide="${state.pomodoro.soundEnabled ? 'volume-2' : 'volume-x'}" class="w-4 h-4 ${state.pomodoro.soundEnabled ? 'text-emerald-600' : 'text-slate-400'}"></i>
+            </button>
+          </div>
+
+          <!-- Task Attachment -->
+          <div class="w-full mt-8 pt-6 border-t border-slate-100 space-y-3">
+            <div class="flex items-center justify-between">
+              <label class="text-xs font-semibold text-slate-600 flex items-center gap-1.5 uppercase tracking-wider">
+                <i data-lucide="link-2" class="w-3.5 h-3.5 text-emerald-600"></i> Attach to Task
+              </label>
+              ${attachedTask ? `<span class="text-[11px] text-emerald-600 font-medium">Logged: ${attachedTask.actualTimeLoggedMinutes}m / Est: ${attachedTask.estimatedTimeMinutes}m</span>` : ''}
+            </div>
+
+            <select onchange="state.pomodoro.attachedTaskId=this.value ? Number(this.value) : null; render();" class="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs bg-slate-50 text-slate-700 focus:outline-none focus:ring-2 focus:ring-emerald-500">
+              <option value="">No task attached (General Time Log)</option>
+              ${state.tasks.map(t => `
+                <option value="${t.id}" ${state.pomodoro.attachedTaskId === t.id ? 'selected' : ''}>
+                  [${t.category}] ${t.title} ${t.completed ? '✓' : ''}
+                </option>
+              `).join('')}
+            </select>
+
+            <div>
+              <label class="text-xs font-semibold text-slate-600 flex items-center gap-1.5 uppercase tracking-wider mb-1">
+                <i data-lucide="file-text" class="w-3.5 h-3.5 text-slate-400"></i> Session Notes
+              </label>
+              <input type="text" oninput="state.pomodoro.sessionNotes=this.value;" value="${state.pomodoro.sessionNotes}" placeholder="What did you focus on during this sprint?" class="w-full px-3 py-1.5 border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-emerald-500 bg-white" />
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderKanban(tasks) {
+      const cols = [
+        { id: 'todo', title: 'To Do', tasks: tasks.filter(t => !t.completed && (t.actualTimeLoggedMinutes === 0 || !t.actualTimeLoggedMinutes)), accent: 'border-slate-300' },
+        { id: 'in-progress', title: 'In Progress', tasks: tasks.filter(t => !t.completed && t.actualTimeLoggedMinutes > 0), accent: 'border-amber-400' },
+        { id: 'completed', title: 'Completed', tasks: tasks.filter(t => t.completed), accent: 'border-emerald-500' }
+      ];
+
+      return `
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+          ${cols.map(col => `
+            <div class="bg-slate-50/70 rounded-2xl border border-slate-200/80 p-4 flex flex-col h-full">
+              <div class="flex items-center justify-between pb-3 border-b border-slate-200 mb-3">
+                <div class="flex items-center gap-2">
+                  <span class="w-2.5 h-2.5 rounded-full border-2 ${col.accent}"></span>
+                  <h4 class="font-bold text-slate-800 text-sm">${col.title}</h4>
+                </div>
+                <span class="text-xs bg-slate-200/80 text-slate-600 px-2 py-0.5 rounded-full font-semibold">${col.tasks.length}</span>
+              </div>
+
+              <div class="space-y-3 flex-1 overflow-y-auto min-h-[300px]">
+                ${col.tasks.map(task => `
+                  <div class="bg-white rounded-xl border border-slate-200 p-4 shadow-xs hover:shadow-md transition group">
+                    <div class="flex items-center justify-between gap-2 mb-2">
+                      <div class="flex items-center gap-1.5">
+                        ${getCategoryBadge(task.category)}
+                        ${getPriorityBadge(task.priority)}
+                      </div>
+                      <div class="flex items-center gap-1">
+                        <button onclick="state.taskToEdit=state.tasks.find(x=>x.id===${task.id}); state.isModalOpen=true; render();" class="p-1 hover:text-blue-600 text-slate-400" title="Edit"><i data-lucide="edit-3" class="w-3.5 h-3.5"></i></button>
+                        <button onclick="deleteTask(${task.id})" class="p-1 hover:text-rose-600 text-slate-400" title="Delete"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>
+                      </div>
+                    </div>
+
+                    <h5 class="font-semibold text-sm text-slate-800 ${task.completed ? 'line-through text-slate-400' : ''}">${task.title}</h5>
+                    ${task.description ? `<p class="text-xs text-slate-500 mt-1 line-clamp-2">${task.description}</p>` : ''}
+
+                    <div class="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between text-xs">
+                      <div class="flex items-center gap-2 text-slate-400">
+                        <i data-lucide="clock" class="w-3.5 h-3.5"></i>
+                        <span>${task.actualTimeLoggedMinutes}m / ${task.estimatedTimeMinutes}m</span>
+                      </div>
+                      <div class="flex items-center gap-2">
+                        <button onclick="toggleTaskComplete(${task.id})" class="p-1.5 rounded-lg border transition ${task.completed ? 'bg-emerald-50 text-emerald-600 border-emerald-200' : 'text-slate-400 border-slate-200 hover:text-emerald-600'}">
+                          <i data-lucide="check" class="w-3.5 h-3.5"></i>
+                        </button>
+                        ${!task.completed ? `
+                          <button onclick="startPomodoroForTask(${task.id})" class="p-1.5 rounded-lg bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border border-emerald-200 transition" title="Start Pomodoro">
+                            <i data-lucide="play" class="w-3.5 h-3.5 fill-emerald-600"></i>
+                          </button>
+                        ` : ''}
+                      </div>
+                    </div>
+                  </div>
+                `).join('')}
+
+                ${col.tasks.length === 0 ? `<div class="h-32 flex items-center justify-center text-xs text-slate-400 border border-dashed border-slate-200 rounded-xl">No tasks in ${col.title}</div>` : ''}
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      `;
+    }
+
+    function renderListView(tasks) {
+      return `
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden divide-y divide-slate-100">
+          ${tasks.map(task => `
+            <div class="p-4 flex items-center justify-between gap-4 hover:bg-slate-50/70 transition">
+              <div class="flex items-center gap-3 flex-1 min-w-0">
+                <button onclick="toggleTaskComplete(${task.id})" class="text-slate-400 hover:text-emerald-600">
+                  <i data-lucide="${task.completed ? 'check-circle-2' : 'circle'}" class="w-5 h-5 ${task.completed ? 'text-emerald-600' : 'text-slate-300'}"></i>
+                </button>
+                <div class="flex-1 min-w-0">
+                  <div class="flex items-center gap-2 mb-0.5">
+                    <span class="text-sm font-semibold text-slate-800 ${task.completed ? 'line-through text-slate-400' : ''}">${task.title}</span>
+                    ${getCategoryBadge(task.category)}
+                    ${getPriorityBadge(task.priority)}
+                  </div>
+                  ${task.description ? `<p class="text-xs text-slate-400 truncate">${task.description}</p>` : ''}
+                </div>
+              </div>
+
+              <div class="flex items-center gap-6 text-xs text-slate-500">
+                <div class="flex items-center gap-1.5 font-mono">
+                  <i data-lucide="clock" class="w-3.5 h-3.5 text-slate-400"></i>
+                  <span>${task.actualTimeLoggedMinutes}m / ${task.estimatedTimeMinutes}m</span>
+                </div>
+                ${task.dueDate ? `
+                  <div class="flex items-center gap-1.5">
+                    <i data-lucide="calendar" class="w-3.5 h-3.5 text-slate-400"></i>
+                    <span>${task.dueDate}</span>
+                  </div>
+                ` : ''}
+                <div class="flex items-center gap-2">
+                  ${!task.completed ? `
+                    <button onclick="startPomodoroForTask(${task.id})" class="px-2.5 py-1 rounded-md bg-emerald-50 text-emerald-700 hover:bg-emerald-100 font-semibold text-[11px] flex items-center gap-1 border border-emerald-200">
+                      <i data-lucide="play" class="w-3 h-3 fill-emerald-600"></i> Focus
+                    </button>
+                  ` : ''}
+                  <button onclick="state.taskToEdit=state.tasks.find(x=>x.id===${task.id}); state.isModalOpen=true; render();" class="p-1 hover:text-blue-600 text-slate-400"><i data-lucide="edit-3" class="w-3.5 h-3.5"></i></button>
+                  <button onclick="deleteTask(${task.id})" class="p-1 hover:text-rose-600 text-slate-400"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>
+                </div>
+              </div>
+            </div>
+          `).join('')}
+
+          ${tasks.length === 0 ? `<div class="p-12 text-center text-slate-400 text-xs">No matching tasks found.</div>` : ''}
+        </div>
+      `;
+    }
+
+    function renderTaskModal() {
+      const edit = state.taskToEdit;
+      return `
+        <div class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm">
+          <div class="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-slate-100 animate-in fade-in zoom-in-95 duration-150">
+            <div class="flex items-center justify-between pb-4 border-b border-slate-100">
+              <h3 class="text-lg font-bold text-slate-900">${edit ? 'Edit Task' : 'Create New Task'}</h3>
+              <button onclick="state.isModalOpen=false; state.taskToEdit=null; render();" class="text-slate-400 hover:text-slate-600 p-1 rounded-lg hover:bg-slate-100">
+                <i data-lucide="x" class="w-5 h-5"></i>
+              </button>
+            </div>
+
+            <form onsubmit="handleSaveTask(event)" class="mt-4 space-y-4">
+              <div>
+                <label class="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">Task Title *</label>
+                <input type="text" name="title" value="${edit ? edit.title : ''}" placeholder="e.g. Implement authentication filter" required class="w-full px-3.5 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500" />
+              </div>
+
+              <div>
+                <label class="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">Description</label>
+                <textarea rows="3" name="description" placeholder="Provide context..." class="w-full px-3.5 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 resize-none">${edit && edit.description ? edit.description : ''}</textarea>
+              </div>
+
+              <div class="grid grid-cols-2 gap-4">
+                <div>
+                  <label class="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">Category</label>
+                  <select name="category" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 bg-white">
+                    <option value="WORK" ${edit && edit.category === 'WORK' ? 'selected' : ''}>Work</option>
+                    <option value="PERSONAL" ${edit && edit.category === 'PERSONAL' ? 'selected' : ''}>Personal</option>
+                    <option value="STUDY" ${edit && edit.category === 'STUDY' ? 'selected' : ''}>Study</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">Priority</label>
+                  <select name="priority" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 bg-white">
+                    <option value="HIGH" ${edit && edit.priority === 'HIGH' ? 'selected' : ''}>High</option>
+                    <option value="MEDIUM" ${edit && edit.priority === 'MEDIUM' ? 'selected' : ''}>Medium</option>
+                    <option value="LOW" ${edit && edit.priority === 'LOW' ? 'selected' : ''}>Low</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="grid grid-cols-2 gap-4">
+                <div>
+                  <label class="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">Due Date</label>
+                  <input type="date" name="dueDate" value="${edit && edit.dueDate ? edit.dueDate : ''}" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 bg-white" />
+                </div>
+                <div>
+                  <label class="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">Estimated Time (mins)</label>
+                  <input type="number" min="0" step="5" name="estimatedTimeMinutes" value="${edit ? edit.estimatedTimeMinutes : 25}" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500" />
+                </div>
+              </div>
+
+              ${edit ? `
+                <div class="pt-2 flex items-center gap-2">
+                  <input type="checkbox" id="task-completed-check" name="completed" ${edit.completed ? 'checked' : ''} class="w-4 h-4 text-emerald-600 rounded" />
+                  <label for="task-completed-check" class="text-xs font-medium text-slate-700 cursor-pointer">Mark as completed</label>
+                </div>
+              ` : ''}
+
+              <div class="pt-4 flex items-center justify-end gap-3 border-t border-slate-100">
+                <button type="button" onclick="state.isModalOpen=false; state.taskToEdit=null; render();" class="px-4 py-2 border border-slate-200 text-slate-600 rounded-lg text-xs font-medium hover:bg-slate-50 transition">Cancel</button>
+                <button type="submit" class="inline-flex items-center gap-1.5 px-4 py-2 bg-emerald-600 text-white rounded-lg text-xs font-medium hover:bg-emerald-700 transition shadow-sm">
+                  <i data-lucide="check" class="w-3.5 h-3.5"></i>
+                  ${edit ? 'Save Changes' : 'Create Task'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      `;
+    }
+
+    // Initial Kickoff
+    if (state.token) {
+      loadData();
+    } else {
+      render();
+    }
+  </script>
+</body>
+</html>
